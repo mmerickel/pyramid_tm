@@ -2,12 +2,7 @@ import sys
 import transaction
 
 from pyramid.httpexceptions import HTTPNotFound
-from pyramid.interfaces import IRequestExtensions
-from pyramid.interfaces import IRequestFactory
-from pyramid.request import Request, apply_request_extensions
 from pyramid.settings import asbool
-from pyramid.threadlocal import manager as request_manager
-from pyramid.tweens import EXCVIEW
 from pyramid.util import DottedNameResolver
 
 from .compat import reraise
@@ -48,58 +43,54 @@ class AbortWithResponse(Exception):
         self.response = response
 
 
-def tm_tween_factory(handler, registry):
-    settings = registry.settings
-    old_commit_veto = settings.get('pyramid_tm.commit_veto', None)
-    commit_veto = settings.get('tm.commit_veto', old_commit_veto)
-    activate = settings.get('tm.activate_hook')
-    attempts = int(settings.get('tm.attempts', 1))
-    commit_veto = resolver.maybe_resolve(commit_veto) if commit_veto else None
-    activate = resolver.maybe_resolve(activate) if activate else None
-    annotate_user = asbool(settings.get('tm.annotate_user', True))
-    request_factory = registry.queryUtility(IRequestFactory, default=Request)
-    request_extensions = registry.queryUtility(IRequestExtensions)
-    assert attempts > 0
+class TransactionExecutionPolicy(object):
+    def __init__(self,
+                 attempts=1,
+                 commit_veto=None,
+                 activate_hook=None,
+                 annotate_user=True,
+                 ):
+        self.attempts = attempts
+        self.commit_veto = commit_veto
+        self.activate_hook = activate_hook
+        self.annotate_user = annotate_user
 
-    def tm_tween(request):
+    def __call__(self, environ, router):
+        # make the original request
+        request = router.make_request(environ)
+
         if (
             # don't handle txn mgmt if repoze.tm is in the WSGI pipeline
-            'repoze.tm.active' in request.environ or
+            'repoze.tm.active' in environ or
             # pyramid_tm should only be active once
-            'tm.active' in request.environ or
+            'tm.active' in environ or
             # check activation hooks
-            activate is not None and not activate(request)
+            self.activate_hook is not None and not self.activate_hook(request)
         ):
-            return handler(request)
+            return router.invoke_request(request)
 
         # if we are supporting multiple attempts then we must make
         # make the body seekable in order to re-use it across multiple
         # attempts. make_body_seekable will copy wsgi.input if
         # necessary, otherwise it will rewind the copy to position zero
-        if attempts != 1:
+        if self.attempts != 1:
             request.make_body_seekable()
 
-        # hang onto a reference to the original request as it's the thing
-        # used above the tm tween, we can't change that
-        orig_request = request
-        manager = None
+        # grab a reference to the manager which we will use across attempts
+        manager = request.tm
 
-        for number in range(attempts):
-            is_last_attempt = (number == attempts - 1)
+        for number in range(self.attempts):
+            is_last_attempt = (number == self.attempts - 1)
 
             # track the attempt info in the environ
             # try to set it as soon as possible so that it's available
             # in the request factory and elsewhere if people want it
             # note: set all of these values here as they are cleared after
             # each attempt
-            environ = request.environ
             environ['tm.active'] = True
             environ['tm.attempt'] = number
-            environ['tm.attempts'] = attempts
-
-            # do not touch request.tm until we've set it active or it'll raise
-            if manager is None:
-                manager = request.tm
+            environ['tm.attempts'] = self.attempts
+            environ['tm.manager'] = manager
 
             # if we are not on the first attempt then we should start
             # with a new request object and throw away any changes to
@@ -108,26 +99,15 @@ def tm_tween_factory(handler, registry):
             if number > 0:
                 # try to make sure this code stays in sync with pyramid's
                 # router which normally creates requests
-                request = request_factory(environ)
+                request = router.make_request(environ)
                 request.tm = manager
-                request.registry = registry
-                request.invoke_subrequest = orig_request.invoke_subrequest
-                apply_request_extensions(request, extensions=request_extensions)
-
-            # push the new request onto the threadlocal stack
-            # this should be safe unless someone is doing something
-            # really funky
-            request_manager.push({
-                'request': request,
-                'registry': registry,
-            })
 
             try:
                 t = manager.begin()
 
                 # do not address the authentication policy until we are within
                 # the transaction boundaries
-                if annotate_user:
+                if self.annotate_user:
                     userid = request.unauthenticated_userid
                     if userid:
                         userid = text_(userid, 'utf-8')
@@ -137,7 +117,7 @@ def tm_tween_factory(handler, registry):
                 except UnicodeDecodeError:
                     t.note(text_("Unable to decode path as unicode"))
 
-                response = handler(request)
+                response = router.invoke_request(request)
                 if manager.isDoomed():
                     raise AbortWithResponse(response)
 
@@ -160,8 +140,8 @@ def tm_tween_factory(handler, registry):
                     else:
                         reraise(*exc_info)
 
-                if commit_veto is not None:
-                    veto = commit_veto(request, response)
+                if self.commit_veto is not None:
+                    veto = self.commit_veto(request, response)
                     if veto:
                         raise AbortWithResponse(response)
                 manager.commit()
@@ -191,19 +171,10 @@ def tm_tween_factory(handler, registry):
 
             # cleanup any changes we made to the request
             finally:
-                request_manager.pop()
-
                 del environ['tm.active']
                 del environ['tm.attempt']
                 del environ['tm.attempts']
-
-                # propagate exception info back to the original request,
-                # possibly clearing out a retryable error triggered from the
-                # first attempt
-                orig_request.exception = getattr(request, 'exception', None)
-                orig_request.exc_info = getattr(request, 'exc_info', None)
-
-    return tm_tween
+                del environ['tm.manager']
 
 
 def render_exception(request, exc_info):
@@ -296,6 +267,25 @@ def create_tm(request):
         return transaction.manager
 
 
+def policy_from_settings(settings):
+    maybe_resolve = lambda val: resolver.maybe_resolve(val) if val else None
+    old_commit_veto = settings.get('pyramid_tm.commit_veto', None)
+    commit_veto = settings.get('tm.commit_veto', old_commit_veto)
+    activate_hook = settings.get('tm.activate_hook')
+    attempts = int(settings.get('tm.attempts', 1))
+    commit_veto = maybe_resolve(commit_veto)
+    activate_hook = maybe_resolve(activate_hook)
+    annotate_user = asbool(settings.get('tm.annotate_user', True))
+    assert attempts > 0
+
+    return TransactionExecutionPolicy(
+        attempts=attempts,
+        commit_veto=commit_veto,
+        activate_hook=activate_hook,
+        annotate_user=annotate_user,
+    )
+
+
 def includeme(config):
     """
     Set up an implicit 'tween' to do transaction management using the
@@ -330,8 +320,10 @@ def includeme(config):
     should execute.
 
     """
+    settings = config.get_settings()
+    policy = policy_from_settings(settings)
+    config.set_execution_policy(policy)
     config.add_request_method(create_tm, name='tm', reify=True)
-    config.add_tween('pyramid_tm.tm_tween_factory', over=EXCVIEW)
     config.add_view_predicate('tm_last_attempt', LastAttemptPredicate)
     config.add_view_predicate(
         'tm_exc_is_retryable', RetryableExceptionPredicate)
